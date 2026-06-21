@@ -1,0 +1,35 @@
+
+Walk me through how ArgoCD syncs a Helm chart change from a PR merge to production.
+
+
+ArgoCD Helm Chart Sync: PR Merge to Production
+The Full Flow
+1. PR Merge triggers CI
+
+Developer merges a PR that bumps a value in values.yaml (e.g., image tag v1.2.3 → v1.2.4)
+CI pipeline (GitHub Actions / GitLab CI) runs: lint, unit tests, helm template | kubeval to validate rendered manifests
+Artifacts stay in Git — no direct cluster interaction from CI
+2. ArgoCD detects the change
+
+ArgoCD polls the Git repo every ~3 minutes by default (or receives a webhook push for near-instant detection)
+It re-renders the Helm chart using the new values and compares the output against the live cluster state
+Status flips from Synced to OutOfSync
+3. Sync decision
+
+Auto-sync on: ArgoCD immediately applies the diff — kubectl apply of only the changed resources
+Auto-sync off: operator manually triggers argocd app sync <app> or approves via UI
+4. Helm rendering happens inside ArgoCD
+
+ArgoCD runs helm template server-side using the chart + values from the repo
+It does NOT use helm install/upgrade — it converts Helm output to plain Kubernetes manifests and manages them with its own apply engine
+This is why helm list won't show ArgoCD-managed releases by default
+5. Apply and health check
+
+ArgoCD applies the diff to the target namespace
+It watches resource health: Deployment → ReplicaSet → Pods become Running
+Once all resources are Healthy, app status returns to Synced + Healthy
+6. Rollback
+
+If the new version breaks health checks, ArgoCD marks it Degraded
+Rollback = revert the commit in Git → ArgoCD syncs back to the previous state
+No imperative helm rollback needed — Git history IS the rollback mechanism

@@ -1,0 +1,188 @@
+# Interview Question: Walk me through how FluxCD syncs a Helm chart change from a PR merge to production.
+
+---
+
+## Full Data Flow Diagram
+
+```
+Developer
+  │
+  │ 1. Edit values.yaml (replicaCount: 1 → 2)
+  │ 2. Bump Chart.yaml  (version: 0.1.0 → 0.2.0)  ← REQUIRED in Flux
+  │ 3. Open PR → CI validates → Merge to main
+  ▼
+GitHub Repo (prabumohanur/gitops.demo)
+  └── helm/
+      ├── Chart.yaml       (version: 0.2.0)
+      ├── values.yaml      (replicaCount: 2)
+      └── templates/
+          └── deployment.yaml
+  │
+  │ (Flux polls every interval, e.g. 1m)
+  ▼
+┌─────────────────────────────────────────────────┐
+│              flux-system namespace               │
+│                                                 │
+│  source-controller                              │
+│  ┌─────────────────────────────────────────┐   │
+│  │ Watches: GitRepository CR               │   │
+│  │ Action:  git clone → creates artifact   │   │
+│  │ Detects: new commit SHA                 │   │
+│  │ Status:  READY True                     │   │
+│  └──────────────────┬──────────────────────┘   │
+│                     │ artifact ready            │
+│                     ▼                           │
+│  helm-controller                                │
+│  ┌─────────────────────────────────────────┐   │
+│  │ Watches: HelmRelease CR                 │   │
+│  │ Checks:  chart version 0.1.0 → 0.2.0   │   │
+│  │ Action:  helm upgrade with new values   │   │
+│  │ Status:  applied revision 0.2.0         │   │
+│  └──────────────────┬──────────────────────┘   │
+│                     │                           │
+│  notification-controller                        │
+│  ┌─────────────────────────────────────────┐   │
+│  │ Sends alert on sync success/failure     │   │
+│  │ Providers: Slack, Teams, webhook        │   │
+│  └─────────────────────────────────────────┘   │
+└─────────────────────┬───────────────────────────┘
+                      │ kubectl apply
+                      ▼
+              default namespace
+              └── Deployment: demo-app (replicas: 2)
+                  ├── Pod: demo-app-xxxx  Running ✓
+                  └── Pod: demo-app-yyyy  Running ✓
+```
+
+---
+
+## Step-by-Step Answer
+
+### Step 1 — Developer raises a PR
+- Developer edits `values.yaml` (e.g. image tag or replica count)
+- Developer bumps `Chart.yaml` version (e.g. `0.1.0 → 0.2.0`) — required for Flux to trigger upgrade
+- PR opened → CI pipeline runs:
+  - `helm template . | kubeconform` → validates rendered YAML
+  - lint, unit tests
+- PR merged to main
+
+### Step 2 — source-controller detects the change
+- Flux's `source-controller` polls GitHub every interval (e.g. 1 minute)
+- Detects new commit SHA on main branch
+- git clones the repo and packages `helm/` folder as a versioned artifact (tarball)
+- Updates `GitRepository` CR status:
+  ```
+  REVISION: main@sha1:ca5b8dd3
+  READY:    True
+  ```
+
+### Step 3 — helm-controller triggers upgrade
+- `helm-controller` watches the `HelmRelease` CR
+- Compares chart version: `0.1.0 (old) → 0.2.0 (new)` — version changed, upgrade triggered
+- Runs `helm upgrade` with values from the new artifact
+- Updates `HelmRelease` CR status:
+  ```
+  applied revision 0.2.0
+  ```
+
+### Step 4 — Resources applied to cluster
+- `helm upgrade` renders the chart and applies the diff to target namespace
+- Deployment updated → new ReplicaSet created → Pods start
+- Flux inventory updated to track all managed resources
+
+### Step 5 — Notification (optional)
+- `notification-controller` sends success/failure alerts to Slack or webhook
+
+---
+
+## Key Flux Commands for This Flow
+
+```bash
+# Check if source-controller pulled the latest commit
+flux get sources git
+
+# Check HelmRelease status
+flux get helmreleases
+
+# Force a manual reconcile (don't wait for interval)
+flux reconcile helmrelease demo-app-flux
+
+# Check detailed status
+kubectl describe helmrelease demo-app-flux -n flux-system
+
+# Watch pods come up
+watch kubectl get pods -n default
+```
+
+---
+
+## Important: What Triggers a Flux Sync
+
+| Change Made | Flux Syncs? | Why |
+|---|---|---|
+| values.yaml changed + Chart.yaml version bumped | YES | New chart version detected |
+| values.yaml changed only (no version bump) | NO | ReconcileStrategy: ChartVersion |
+| New commit pushed (any file) | Partial | source-controller updates, helm-controller checks version |
+| Manual kubectl scale | NO self-heal | Helm sees no chart change |
+| kubectl delete deployment | YES self-heal | Inventory detects missing resource |
+
+---
+
+## Flux vs ArgoCD — Key Difference to Mention
+
+```
+ArgoCD                              FluxCD
+──────────────────────────          ──────────────────────────
+Compares Git vs cluster directly    Delegates to Helm upgrade
+Self-heals any drift                Only syncs on chart version change
+No version bump needed              Must bump Chart.yaml version
+Single Application CR               GitRepository + HelmRelease (2 CRs)
+```
+
+> "Unlike ArgoCD which compares Git directly against the cluster and
+> self-heals any drift, Flux delegates to Helm's upgrade mechanism.
+> This means you must bump the chart version in Chart.yaml for Flux
+> to trigger a Helm upgrade — just changing values.yaml is not enough."
+
+---
+
+## Hands-on Demo Commands (what we ran)
+
+```bash
+# 1. Install Flux on cluster
+flux install
+
+# 2. Create GitRepository (source-controller watches this)
+flux create source git gitops-demo \
+  --url=https://github.com/prabumohanur/gitops.demo.git \
+  --branch=main \
+  --interval=1m
+
+# 3. Create HelmRelease (helm-controller deploys this)
+flux create helmrelease demo-app-flux \
+  --source=GitRepository/gitops-demo \
+  --chart=./helm \
+  --interval=1m \
+  --target-namespace=default
+
+# 4. Simulate PR merge — change values + bump version
+# Edit helm/values.yaml: replicaCount: 1 → 2
+# Edit helm/Chart.yaml:  version: 0.1.0 → 0.2.0
+git add helm/values.yaml helm/Chart.yaml
+git commit -m "feat: scale to 2 replicas"
+git push origin main
+
+# 5. Watch Flux sync
+flux get helmreleases
+kubectl get pods -n default
+```
+
+---
+
+## One-liner Summary for Interview
+
+> "FluxCD uses two resources — GitRepository tells source-controller to
+> watch the GitHub repo, and HelmRelease tells helm-controller to deploy
+> the chart. When a PR is merged with a bumped chart version, source-controller
+> detects the new commit, creates an artifact, and helm-controller runs
+> helm upgrade — bringing the new pods up in the target namespace."
